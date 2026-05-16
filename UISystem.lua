@@ -1322,8 +1322,29 @@ end
 -- ══════════════════════════════════════════════════════════════
 -- SCREEN: PUCK-INDEX
 -- ══════════════════════════════════════════════════════════════
+-- Each unique player entry gets its own row showing all 8 rarity
+-- slots. Collected slots show the card with correct OVR (midpoint
+-- of that rarity's OVR range, or best actual OVR from inventory).
+-- Uncollected slots show a dim locked placeholder.
+-- ══════════════════════════════════════════════════════════════
 local IndexScreen = newScreen("Index")
 local indexGrid, indexPctLabel, indexBarFill
+
+-- Ordered from lowest to highest rarity for left→right display
+local INDEX_RARITY_ORDER = { "Common", "Rare", "Epic", "Legendary", "Mythic", "Secret", "Limited", "EventExclusive" }
+
+-- Midpoint OVR for each rarity (used when player has no actual card of that rarity)
+local function rarityMidOVR(rarityKey)
+	local def = CardDatabase.Rarities[rarityKey]
+	if not def then return 70 end
+	return math.floor((def.OVRMin + def.OVRMax) / 2)
+end
+
+-- Short rarity label for the index rarity strip
+local RARITY_SHORT = {
+	Common="COM", Rare="RAR", Epic="EPC", Legendary="LEG",
+	Mythic="MYT", Secret="SEC", Limited="LIM", EventExclusive="EVT",
+}
 
 local function buildIndexScreen()
 	create("UIListLayout", { SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,10) }, IndexScreen)
@@ -1353,97 +1374,245 @@ local function refreshIndex()
 		if not c:IsA("UIListLayout") then c:Destroy() end
 	end
 
-	local collected     = LocalData.CollectionIndex or {}
-	local total         = CardDatabase.GetTotalCollectibleCards()
-	local count         = LocalData.CollectionCount or 0
-	local pct           = math.floor((count / math.max(total,1)) * 100)
+	local collected = LocalData.CollectionIndex or {}
+	local total     = CardDatabase.GetTotalCollectibleCards()
+	local count     = LocalData.CollectionCount or 0
+	local pct       = math.floor((count / math.max(total,1)) * 100)
 
 	if indexPctLabel then indexPctLabel.Text = pct.."% Complete — "..count.." / "..total end
 	if indexBarFill  then TweenService:Create(indexBarFill, TweenInfo.new(0.6,Enum.EasingStyle.Quad), { Size=UDim2.new(pct/100,0,1,0) }):Play() end
 
-	local rarityOrder    = CardDatabase.RarityOrder
 	local positionOrder  = { "C","LW","RW","D","G" }
 	local positionLabel  = { C="⚔️  Centers", LW="🏒  Left Wings", RW="🥅  Right Wings", D="🛡️  Defensemen", G="🧤  Goalies" }
 	local positionAccent = { C=ACCENT, LW=Color3.fromRGB(80,200,120), RW=Color3.fromRGB(212,83,180), D=GOLD, G=Color3.fromRGB(200,100,255) }
 
+	-- Build inventory lookup: [playerName][rarityKey] → best OVR found in inventory
+	local invBestOVR = {}
+	for _, card in ipairs(LocalData.Inventory or {}) do
+		local n = card.PlayerName
+		local r = card.Rarity
+		if n and r then
+			if not invBestOVR[n] then invBestOVR[n] = {} end
+			local cur = invBestOVR[n][r] or 0
+			if (card.OVR or 0) > cur then invBestOVR[n][r] = card.OVR end
+		end
+	end
+
+	-- Build unique player list per position (deduplicated by Name+Era+Team key
+	-- so the same player with different eras each gets their own row)
 	local byPosition = {}
-	local shown = {}
+	local seenKey = {}
 	for _, pd in ipairs(CardDatabase.Players) do
-		local key = pd.Name
-		if not shown[key] then
-			shown[key] = true
-			local highestRarity, highestRank = nil, 0
-			for _, rk in ipairs(rarityOrder) do
+		-- Use Name+Era+Team as the unique key so "Sidney Crosby All-Time" and
+		-- "Sidney Crosby Rookie Year" are separate rows
+		local key = pd.Name.."||"..pd.Era.."||"..pd.Team
+		if not seenKey[key] then
+			seenKey[key] = true
+			-- Compute highest rarity collected for sort order
+			local highestRank = 0
+			for _, rk in ipairs(INDEX_RARITY_ORDER) do
 				local ck = pd.Name.."_"..rk
 				if collected[ck] then
 					local rank = CardDatabase.RarityRank[rk] or 0
-					if rank > highestRank then highestRank = rank; highestRarity = rk end
+					if rank > highestRank then highestRank = rank end
 				end
 			end
 			local pos = pd.Position or "C"
 			if not byPosition[pos] then byPosition[pos] = {} end
-			table.insert(byPosition[pos], { pd=pd, highestRarity=highestRarity, highestRank=highestRank })
+			table.insert(byPosition[pos], { pd=pd, highestRank=highestRank, key=key })
 		end
 	end
+
+	-- Card slot dimensions — 8 per row, compact
+	local CARD_W  = 74   -- card width
+	local CARD_H  = 104  -- card height
+	local CARD_PAD = 5   -- padding between cards
 
 	for _, pos in ipairs(positionOrder) do
 		local group = byPosition[pos]
 		if not group or #group == 0 then continue end
-		table.sort(group, function(a,b) return (a.highestRank or 0) > (b.highestRank or 0) end)
+
+		-- Sort: players with any collected card first (highest rarity → lowest),
+		-- then uncollected players alphabetically
+		table.sort(group, function(a, b)
+			if a.highestRank ~= b.highestRank then return a.highestRank > b.highestRank end
+			return (a.pd.Name or "") < (b.pd.Name or "")
+		end)
 
 		local posColor = positionAccent[pos] or ACCENT
-		local section  = makeFrame({ Name="Section_"..pos, Size=UDim2.new(1,0,0,10), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1 }, indexGrid)
+
+		-- ── Position section wrapper ──────────────────────────────
+		local section = makeFrame({ Name="Section_"..pos, Size=UDim2.new(1,0,0,10),
+			AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1 }, indexGrid)
 		create("UIListLayout", { SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,8) }, section)
 
+		-- ── Section header bar ────────────────────────────────────
 		local sHdr = makeFrame({ Size=UDim2.new(1,0,0,32),
-			BackgroundColor3=Color3.fromRGB(math.clamp(math.floor(posColor.R*255*0.12),0,255),math.clamp(math.floor(posColor.G*255*0.12),0,255),math.clamp(math.floor(posColor.B*255*0.12),0,255)),
+			BackgroundColor3=Color3.fromRGB(
+				math.clamp(math.floor(posColor.R*255*0.12),0,255),
+				math.clamp(math.floor(posColor.G*255*0.12),0,255),
+				math.clamp(math.floor(posColor.B*255*0.12),0,255)),
 			LayoutOrder=0 }, section)
 		corner(8, sHdr)
 		stroke(posColor, 1, sHdr).Transparency = 0.5
 		makeFrame({ Size=UDim2.new(0,4,1,0), BackgroundColor3=posColor }, sHdr)
-		makeLabel({ Size=UDim2.new(0.6,0,1,0), Position=UDim2.new(0,12,0,0), Text=positionLabel[pos] or pos,
-			TextColor3=posColor, Font=Enum.Font.GothamBold, TextSize=13, TextXAlignment=Enum.TextXAlignment.Left }, sHdr)
+		makeLabel({ Size=UDim2.new(0.55,0,1,0), Position=UDim2.new(0,12,0,0),
+			Text=positionLabel[pos] or pos, TextColor3=posColor,
+			Font=Enum.Font.GothamBold, TextSize=13, TextXAlignment=Enum.TextXAlignment.Left }, sHdr)
 
-		local foundCount = 0
-		for _, e in ipairs(group) do if e.highestRarity then foundCount += 1 end end
-		local countBadge = makeFrame({ Size=UDim2.new(0,60,0,22), Position=UDim2.new(1,-68,0.5,-11),
-			BackgroundColor3=Color3.fromRGB(math.clamp(math.floor(posColor.R*255*0.2),0,255),math.clamp(math.floor(posColor.G*255*0.2),0,255),math.clamp(math.floor(posColor.B*255*0.2),0,255)) }, sHdr)
+		-- Count badge: how many individual rarity slots collected vs total possible
+		local slotsCollected = 0
+		local slotsTotal     = #group * #INDEX_RARITY_ORDER
+		for _, e in ipairs(group) do
+			for _, rk in ipairs(INDEX_RARITY_ORDER) do
+				local ck = e.pd.Name.."_"..rk
+				if collected[ck] then slotsCollected += 1 end
+			end
+		end
+		local countBadge = makeFrame({ Size=UDim2.new(0,80,0,22), Position=UDim2.new(1,-88,0.5,-11),
+			BackgroundColor3=Color3.fromRGB(
+				math.clamp(math.floor(posColor.R*255*0.2),0,255),
+				math.clamp(math.floor(posColor.G*255*0.2),0,255),
+				math.clamp(math.floor(posColor.B*255*0.2),0,255)) }, sHdr)
 		corner(6, countBadge)
-		makeLabel({ Size=UDim2.new(1,0,1,0), Text=foundCount.." / "..#group, TextColor3=posColor, Font=Enum.Font.GothamBold, TextSize=11 }, countBadge)
+		makeLabel({ Size=UDim2.new(1,0,1,0),
+			Text=slotsCollected.." / "..slotsTotal,
+			TextColor3=posColor, Font=Enum.Font.GothamBold, TextSize=10 }, countBadge)
 
-		local gridWrap = makeFrame({ Size=UDim2.new(1,0,0,10), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1, LayoutOrder=1 }, section)
-		create("UIGridLayout", { CellSize=UDim2.new(0,92,0,130), CellPadding=UDim2.new(0,7,0,7),
-			HorizontalAlignment=Enum.HorizontalAlignment.Center, SortOrder=Enum.SortOrder.LayoutOrder }, gridWrap)
+		-- ── Per-player rows ───────────────────────────────────────
+		-- Each player gets a horizontal strip: name label on the left,
+		-- then 8 card slots across.
+		local playerList = makeFrame({ Size=UDim2.new(1,0,0,10),
+			AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1, LayoutOrder=1 }, section)
+		create("UIListLayout", { SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,6) }, playerList)
 
-		for i, entry in ipairs(group) do
-			local pd            = entry.pd
-			local highestRarity = entry.highestRarity
-			if highestRarity then
-				local inv = LocalData and LocalData.Inventory or {}
-				local bestOVR, bestVariant = 0, "Base"
-				for _, c in ipairs(inv) do
-					if c.PlayerName == pd.Name and (c.OVR or 0) > bestOVR then bestOVR = c.OVR or 0; bestVariant = c.Variant or "Base" end
+		for pi, entry in ipairs(group) do
+			local pd = entry.pd
+
+			-- Outer row: name label left, card strip right
+			-- Height = card height + top/bottom margin
+			local ROW_H = CARD_H + 10
+			local playerRow = makeFrame({ Size=UDim2.new(1,0,0,ROW_H),
+				BackgroundColor3=Color3.fromRGB(12,14,22), LayoutOrder=pi }, playerList)
+			corner(10, playerRow)
+			stroke(Color3.fromRGB(30,35,55), 1, playerRow)
+
+			-- Left: player name + era label (fixed width 90px)
+			local NAME_W = 90
+			local namePanel = makeFrame({ Size=UDim2.new(0,NAME_W,1,0), Position=UDim2.new(0,0,0,0),
+				BackgroundColor3=Color3.fromRGB(
+					math.clamp(math.floor(posColor.R*255*0.08),0,255),
+					math.clamp(math.floor(posColor.G*255*0.08),0,255),
+					math.clamp(math.floor(posColor.B*255*0.08),0,255)) }, playerRow)
+			corner(10, namePanel)
+
+			-- Position pill
+			local posPill = makeFrame({ Size=UDim2.new(0,22,0,14), Position=UDim2.new(0,6,0,6),
+				BackgroundColor3=Color3.fromRGB(
+					math.clamp(math.floor(posColor.R*255*0.3),0,255),
+					math.clamp(math.floor(posColor.G*255*0.3),0,255),
+					math.clamp(math.floor(posColor.B*255*0.3),0,255)) }, namePanel)
+			corner(4, posPill)
+			makeLabel({ Size=UDim2.new(1,0,1,0), Text=pd.Position,
+				TextColor3=posColor, Font=Enum.Font.GothamBold, TextSize=8 }, posPill)
+
+			-- Last name (large)
+			makeLabel({ Size=UDim2.new(1,-8,0,32), Position=UDim2.new(0,4,0,22),
+				Text=pd.Name:match("(%S+)$") or pd.Name,
+				TextColor3=TEXT_WHITE, Font=Enum.Font.GothamBold, TextSize=11,
+				TextWrapped=true, TextXAlignment=Enum.TextXAlignment.Center }, namePanel)
+
+			-- Team
+			makeLabel({ Size=UDim2.new(1,0,0,12), Position=UDim2.new(0,0,0,56),
+				Text=pd.Team, TextColor3=TEXT_MUTED, Font=Enum.Font.Gotham, TextSize=9 }, namePanel)
+
+			-- Era (small, wrapped)
+			makeLabel({ Size=UDim2.new(1,-4,0,24), Position=UDim2.new(0,2,0,70),
+				Text=pd.Era, TextColor3=TEXT_DIM, Font=Enum.Font.Gotham, TextSize=8,
+				TextWrapped=true, TextXAlignment=Enum.TextXAlignment.Center }, namePanel)
+
+			-- Horizontal scrolling card strip (8 rarity slots)
+			-- We use a horizontal ScrollingFrame so they don't overflow on small screens
+			local stripScroll = create("ScrollingFrame", {
+				Size             = UDim2.new(1,-NAME_W-6,1,-6),
+				Position         = UDim2.new(0,NAME_W+6,0,3),
+				BackgroundTransparency = 1,
+				BorderSizePixel  = 0,
+				ScrollBarThickness = 3,
+				ScrollBarImageColor3 = posColor,
+				CanvasSize       = UDim2.new(0, (#INDEX_RARITY_ORDER*(CARD_W+CARD_PAD)), 0, 0),
+				ScrollingDirection = Enum.ScrollingDirection.X,
+			}, playerRow)
+			create("UIListLayout", {
+				FillDirection     = Enum.FillDirection.Horizontal,
+				VerticalAlignment = Enum.VerticalAlignment.Center,
+				SortOrder         = Enum.SortOrder.LayoutOrder,
+				Padding           = UDim.new(0, CARD_PAD),
+			}, stripScroll)
+
+			for ri, rarityKey in ipairs(INDEX_RARITY_ORDER) do
+				local collectionKey = pd.Name.."_"..rarityKey
+				local isCollected   = collected[collectionKey] == true
+
+				-- Slot container (fixed size card)
+				local slot = makeFrame({ Size=UDim2.new(0,CARD_W,0,CARD_H),
+					BackgroundTransparency=1, LayoutOrder=ri }, stripScroll)
+
+				if isCollected then
+					-- Get best OVR for this player+rarity from inventory,
+					-- fallback to midpoint of rarity OVR range
+					local bestOVR = (invBestOVR[pd.Name] and invBestOVR[pd.Name][rarityKey])
+						or rarityMidOVR(rarityKey)
+
+					local fakeCard = {
+						OVR        = bestOVR,
+						Rarity     = rarityKey,
+						PlayerName = pd.Name,
+						Team       = pd.Team,
+						Variant    = "Base",
+					}
+					local w = makeCardWidget(slot, fakeCard, { size=UDim2.new(1,0,1,0), zBase=2 })
+					w.LayoutOrder = ri
+				else
+					-- Locked placeholder
+					local rc = rarityColor(rarityKey)
+					local cell = makeFrame({ Size=UDim2.new(1,0,1,0),
+						BackgroundColor3=Color3.fromRGB(10,11,18), LayoutOrder=ri }, slot)
+					corner(8, cell)
+					-- Dim border tinted to the rarity colour so you can see what you're chasing
+					local s = stroke(rc, 1, cell)
+					s.Transparency = 0.75
+
+					-- Rarity colour dot at top
+					local dot = makeFrame({ Size=UDim2.new(0,8,0,8), Position=UDim2.new(0.5,-4,0,5),
+						BackgroundColor3=rc }, cell)
+					corner(4, dot)
+
+					-- Lock icon
+					makeLabel({ Size=UDim2.new(1,0,0,24), Position=UDim2.new(0,0,0,16),
+						Text="🔒", TextColor3=Color3.fromRGB(40,46,65),
+						Font=Enum.Font.GothamBold, TextSize=16 }, cell)
+
+					-- Rarity short label
+					makeLabel({ Size=UDim2.new(1,0,0,12), Position=UDim2.new(0,0,0,42),
+						Text=RARITY_SHORT[rarityKey] or rarityKey:sub(1,3):upper(),
+						TextColor3=rc, Font=Enum.Font.GothamBold, TextSize=8 }, cell)
+
+					-- OVR range
+					local rarDef = CardDatabase.Rarities[rarityKey]
+					if rarDef then
+						makeLabel({ Size=UDim2.new(1,0,0,11), Position=UDim2.new(0,0,0,56),
+							Text=rarDef.OVRMin.."-"..rarDef.OVRMax,
+							TextColor3=Color3.fromRGB(40,46,65), Font=Enum.Font.Gotham, TextSize=8 }, cell)
+					end
+
+					-- Bottom "???" strip
+					local unknownStrip = makeFrame({ Size=UDim2.new(1,0,0,14), Position=UDim2.new(0,0,1,-14),
+						BackgroundColor3=Color3.fromRGB(14,15,24) }, cell)
+					create("UICorner", { CornerRadius=UDim.new(0,8) }, unknownStrip)
+					makeLabel({ Size=UDim2.new(1,0,1,0), Text="???",
+						TextColor3=Color3.fromRGB(35,40,58), Font=Enum.Font.GothamBold, TextSize=7 }, unknownStrip)
 				end
-				local fakeCard = { OVR=bestOVR>0 and bestOVR or (CardDatabase.RarityRank[highestRarity] or 1)*10,
-					Rarity=highestRarity, PlayerName=pd.Name, Team=pd.Team, Variant=bestVariant }
-				local w = makeCardWidget(gridWrap, fakeCard, {})
-				w.LayoutOrder = i
-				local posPill = makeFrame({ Size=UDim2.new(0,20,0,13), Position=UDim2.new(0,4,0,8),
-					BackgroundColor3=Color3.fromRGB(math.clamp(math.floor(posColor.R*255*0.3),0,255),math.clamp(math.floor(posColor.G*255*0.3),0,255),math.clamp(math.floor(posColor.B*255*0.3),0,255)),
-					ZIndex=8 }, w)
-				corner(4, posPill)
-				makeLabel({ Size=UDim2.new(1,0,1,0), Text=pd.Position, TextColor3=posColor, Font=Enum.Font.GothamBold, TextSize=8, ZIndex=9 }, posPill)
-			else
-				local cell = makeFrame({ Size=UDim2.new(1,0,1,0), BackgroundColor3=Color3.fromRGB(10,11,18), LayoutOrder=i }, gridWrap)
-				corner(10, cell)
-				stroke(Color3.fromRGB(40,45,65), 1, cell).Transparency = 0.3
-				makeLabel({ Size=UDim2.new(1,0,0,28), Position=UDim2.new(0,0,0,14), Text="🔒", TextColor3=TEXT_DIM, Font=Enum.Font.GothamBold, TextSize=20 }, cell)
-				makeLabel({ Size=UDim2.new(1,-4,0,26), Position=UDim2.new(0,2,0,44), Text=pd.Name:match("(%S+)$") or pd.Name,
-					TextColor3=Color3.fromRGB(55,60,80), Font=Enum.Font.GothamBold, TextSize=10, TextWrapped=true }, cell)
-				makeLabel({ Size=UDim2.new(1,0,0,12), Position=UDim2.new(0,0,0,72), Text=pd.Team, TextColor3=Color3.fromRGB(40,46,65), Font=Enum.Font.Gotham, TextSize=9 }, cell)
-				local unknownStrip = makeFrame({ Size=UDim2.new(1,0,0,16), Position=UDim2.new(0,0,1,-16), BackgroundColor3=Color3.fromRGB(14,15,24) }, cell)
-				create("UICorner", { CornerRadius=UDim.new(0,10) }, unknownStrip)
-				makeLabel({ Size=UDim2.new(1,0,1,0), Text="? ? ?", TextColor3=Color3.fromRGB(40,46,65), Font=Enum.Font.GothamBold, TextSize=8 }, unknownStrip)
 			end
 		end
 	end
